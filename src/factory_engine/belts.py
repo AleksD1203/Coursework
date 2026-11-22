@@ -2,6 +2,7 @@ from collections import deque
 
 from factory_engine.constants import (
     BELT_SPEED,
+    DROP_POS,
     ITEM_SPACING,
     LEFT_LANE,
     MAX_POS,
@@ -165,37 +166,123 @@ class BeltSystem:
             self.rebuild_topology(world)
 
         transitions = 0
+        updated_coords: set[tuple[int, int]] = set()
+        deferred_straight: list[tuple[Lane, BeltItem]] = []
+        deferred_side_loads: list[tuple[Lane, Lane]] = []
+
         for belt in self.update_order:
-            transitions += self._update_belt(belt)
+            transitions += self._update_belt(
+                belt,
+                updated_coords,
+                deferred_straight,
+                deferred_side_loads,
+            )
+            updated_coords.add((belt.x, belt.y))
+
+        for target_lane, item in deferred_straight:
+            inserted = target_lane.insert_item(item)
+            assert inserted
+
+        for source_lane, target_lane in deferred_side_loads:
+            front = source_lane.front_item()
+            if front is not None and target_lane.can_insert_at(DROP_POS):
+                taken = source_lane.take_front_item()
+                assert taken is not None
+                taken.pos = DROP_POS
+                inserted = target_lane.insert_item(taken)
+                assert inserted
+                transitions += 1
+
         return transitions
 
-    def _update_belt(self, belt: Belt) -> int:
+    def _update_belt(
+        self,
+        belt: Belt,
+        updated_coords: set[tuple[int, int]],
+        deferred_straight: list[tuple[Lane, BeltItem]],
+        deferred_side_loads: list[tuple[Lane, Lane]],
+    ) -> int:
         transitions = 0
         next_belt = belt.next_belt
 
         if next_belt is None:
-            transitions += self._advance_lane(belt.lanes[LEFT_LANE], None)
-            transitions += self._advance_lane(belt.lanes[RIGHT_LANE], None)
+            transitions += self._advance_lane(
+                belt.lanes[LEFT_LANE], None, False, deferred_straight
+            )
+            transitions += self._advance_lane(
+                belt.lanes[RIGHT_LANE], None, False, deferred_straight
+            )
             return transitions
+
+        # Defer handoff if next_belt has not updated yet this tick (cycle break point)
+        defer = (next_belt.x, next_belt.y) not in updated_coords
 
         if belt.side_load_target_lane is not None:
             target_lane = next_belt.lanes[belt.side_load_target_lane]
-            transitions += self._advance_lane(belt.lanes[LEFT_LANE], target_lane)
-            transitions += self._advance_lane(belt.lanes[RIGHT_LANE], target_lane)
+            transitions += self._advance_side_load_lane(
+                belt.lanes[LEFT_LANE], target_lane, defer, deferred_side_loads
+            )
+            transitions += self._advance_side_load_lane(
+                belt.lanes[RIGHT_LANE], target_lane, defer, deferred_side_loads
+            )
             return transitions
 
         transitions += self._advance_lane(
-            belt.lanes[LEFT_LANE], next_belt.lanes[LEFT_LANE]
+            belt.lanes[LEFT_LANE], next_belt.lanes[LEFT_LANE], defer, deferred_straight
         )
         transitions += self._advance_lane(
-            belt.lanes[RIGHT_LANE], next_belt.lanes[RIGHT_LANE]
+            belt.lanes[RIGHT_LANE], next_belt.lanes[RIGHT_LANE], defer, deferred_straight
         )
+        return transitions
+
+    def _advance_side_load_lane(
+        self,
+        source_lane: Lane,
+        target_lane: Lane,
+        defer: bool,
+        deferred_side_loads: list[tuple[Lane, Lane]],
+    ) -> int:
+        if source_lane.is_empty():
+            return 0
+
+        transitions = 0
+        items = source_lane.items
+        start_idx = 0
+
+        front = items[0]
+        wants_transfer = front.pos + self.speed >= TILE_LEN
+
+        if wants_transfer and not defer and target_lane.can_insert_at(DROP_POS):
+            front.pos = DROP_POS
+            inserted = target_lane.insert_item(front)
+            assert inserted
+            start_idx = 1
+            transitions = 1
+
+        remaining: list[BeltItem] = []
+        prev_pos: int | None = None
+
+        for item in items[start_idx:]:
+            limit = MAX_POS if prev_pos is None else prev_pos - ITEM_SPACING
+            candidate_pos = min(item.pos + self.speed, limit)
+            new_pos = max(item.pos, candidate_pos)
+            item.pos = new_pos
+            prev_pos = new_pos
+            remaining.append(item)
+
+        source_lane.items = remaining
+
+        if wants_transfer and defer and transitions == 0:
+            deferred_side_loads.append((source_lane, target_lane))
+
         return transitions
 
     def _advance_lane(
         self,
         source_lane: Lane,
         target_lane: Lane | None,
+        defer: bool,
+        deferred_straight: list[tuple[Lane, BeltItem]],
     ) -> int:
         if source_lane.is_empty():
             return 0
@@ -210,6 +297,7 @@ class BeltSystem:
             else:
                 limit = prev_virtual_pos - ITEM_SPACING
 
+            # Never push an item backwards if a jam already exists ahead
             candidate_pos = min(item.pos + self.speed, limit)
             new_pos = max(item.pos, candidate_pos)
             prev_virtual_pos = new_pos
@@ -225,7 +313,11 @@ class BeltSystem:
         source_lane.items = remaining
         if transferred:
             assert target_lane is not None
-            target_lane.items.extend(transferred)
+            if defer:
+                for moved in transferred:
+                    deferred_straight.append((target_lane, moved))
+            else:
+                target_lane.items.extend(transferred)
 
         return len(transferred)
 
