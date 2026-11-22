@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -324,12 +325,37 @@ def world_from_json(raw_json: str) -> World:
     return world_from_dict(parsed)
 
 
+class PersistenceError(Exception):
+    """Raised when saving or loading a world fails due to an I/O error."""
+
+
+def _write_text_fsync(path: Path, content: str) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def save_world_to_file(world: World, path: str | Path) -> None:
     file_path = Path(path)
-    file_path.write_text(world_to_json(world), encoding="utf-8")
+    tmp_path = file_path.with_name(f"{file_path.name}.tmp")
+    payload = world_to_json(world)
+    try:
+        _write_text_fsync(tmp_path, payload)
+        os.replace(tmp_path, file_path)
+    except OSError as exc:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise PersistenceError(f"Failed to save world to {file_path}: {exc}") from exc
 
 
 def load_world_from_file(path: str | Path) -> World:
     file_path = Path(path)
-    raw_json = file_path.read_text(encoding="utf-8")
+    try:
+        raw_json = file_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PersistenceError(f"Failed to read world from {file_path}: {exc}") from exc
     return world_from_json(raw_json)
