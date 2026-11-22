@@ -23,6 +23,8 @@ from factory_engine.entities import (
 )
 from factory_engine.world import World
 
+class PersistenceError(Exception):
+    """Raised when saving, loading, or parsing a world fails."""
 
 def _require_dict(value: Any, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
@@ -244,7 +246,7 @@ def world_to_dict(world: World) -> dict[str, Any]:
     }
 
 
-def world_from_dict(data: dict[str, Any]) -> World:
+def _parse_world_dict(data: dict[str, Any]) -> World:
     root = _require_dict(data, "save root")
 
     version = _require_int(root.get("version"), "version")
@@ -312,6 +314,13 @@ def world_from_dict(data: dict[str, Any]) -> World:
     return world
 
 
+def world_from_dict(data: dict[str, Any]) -> World:
+    try:
+        return _parse_world_dict(data)
+    except ValueError as exc:
+        raise PersistenceError(str(exc)) from exc
+
+
 def world_to_json(world: World) -> str:
     payload = world_to_dict(world)
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -321,12 +330,8 @@ def world_from_json(raw_json: str) -> World:
     try:
         parsed = json.loads(raw_json)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid JSON save data: {exc}") from exc
+        raise PersistenceError(f"Invalid JSON save data: {exc}") from exc
     return world_from_dict(parsed)
-
-
-class PersistenceError(Exception):
-    """Raised when saving or loading a world fails due to an I/O error."""
 
 
 def _write_text_fsync(path: Path, content: str) -> None:
