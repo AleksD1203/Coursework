@@ -111,15 +111,16 @@ class FactoryEngine:
         y: int,
         item_type: str,
         lane: int = RIGHT_LANE,
-        pos: int = DROP_POS,
     ) -> bool:
         belt = self.world.get_belt_at(x, y)
         if belt is None:
             return False
-        if not belt.can_drop_item(lane_index=lane, pos=pos):
+        if not belt.can_drop_item(lane_index=lane, pos=DROP_POS):
             return False
         uid = self.world.allocate_item_uid()
-        return belt.try_drop_item(uid=uid, item_type=item_type, lane_index=lane, pos=pos)
+        return belt.try_drop_item(
+            uid=uid, item_type=item_type, lane_index=lane, pos=DROP_POS
+            )
 
     def tick(self, steps: int = 1) -> int:
         if steps < 0:
