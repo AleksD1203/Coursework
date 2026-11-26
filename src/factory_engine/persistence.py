@@ -1,13 +1,23 @@
+from collections.abc import Callable
 import json
 import os
 from pathlib import Path
+import tempfile
 from typing import Any
 
 from factory_engine.constants import (
-    LEFT_LANE,
-    RIGHT_LANE,
+    MAX_SAVE_BYTES,
+    MAX_SAVE_ENTITIES,
+    MAX_WORLD_CELLS,
+    MAX_WORLD_DIM,
     SAVE_FORMAT_VERSION,
     InserterState,
+    LaneSide,
+    needs_direction,
+    parse_entity_type,
+    require_strict_int,
+    supports_tier,
+    validate_item_name,
 )
 from factory_engine.entities import (
     Assembler,
@@ -16,15 +26,25 @@ from factory_engine.entities import (
     Chest,
     Deposit,
     Entity,
+    HeldItem,
     Inserter,
     Lane,
     Miner,
+    build_inserter_state,
     create_entity,
 )
 from factory_engine.world import World
 
+
 class PersistenceError(Exception):
-    """Raised when saving, loading, or parsing a world fails."""
+    """Raised when saving, loading, decoding, or validating world state fails."""
+
+
+def _require_key(mapping: dict[str, Any], key: str, context: str) -> Any:
+    if key not in mapping:
+        raise ValueError(f"Missing required key {key!r} in {context}")
+    return mapping[key]
+
 
 def _require_dict(value: Any, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
@@ -38,268 +58,252 @@ def _require_list(value: Any, name: str) -> list[Any]:
     return value
 
 
-def _require_int(value: Any, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"Expected integer for {name}: {value!r}")
-    return value
-
-
-def _require_str(value: Any, name: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"Expected non-empty string for {name}: {value!r}")
-    return value
-
-
-def _serialize_counts(counts: dict[str, int]) -> dict[str, int]:
-    result: dict[str, int] = {}
-    for key in sorted(counts.keys()):
-        amount = counts[key]
-        if amount > 0:
-            result[key] = amount
-    return result
-
-
-def _deserialize_counts(raw: Any, name: str) -> dict[str, int]:
-    data = _require_dict(raw, name)
-    result: dict[str, int] = {}
-    for key, val in data.items():
-        item_type = _require_str(key, f"{name} key")
-        amount = _require_int(val, f"{name}[{item_type}]")
-        if amount < 0:
-            raise ValueError(f"Negative item count in {name}: {amount}")
-        if amount > 0:
-            result[item_type] = amount
-    return result
-
-
 def _serialize_lane(lane: Lane) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for item in lane.items:
-        items.append(
-            {
-                "uid": item.uid,
-                "item_type": item.item_type,
-                "pos": item.pos,
-            }
-        )
-    return items
+    return [
+        {
+            "uid": item.uid,
+            "item_type": item.item_type,
+            "pos": item.pos,
+        }
+        for item in lane.items
+    ]
 
 
-def _deserialize_lane(
-    raw: Any,
-    name: str,
-    seen_uids: set[int],
-) -> Lane:
+def _deserialize_lane(raw: Any, name: str, seen_uids: set[int]) -> Lane:
     raw_items = _require_list(raw, name)
     items: list[BeltItem] = []
     for i, entry in enumerate(raw_items):
-        item_data = _require_dict(entry, f"{name}[{i}]")
-        uid = _require_int(item_data.get("uid"), f"{name}[{i}].uid")
-        item_type = _require_str(item_data.get("item_type"), f"{name}[{i}].item_type")
-        pos = _require_int(item_data.get("pos"), f"{name}[{i}].pos")
+        ctx = f"{name}[{i}]"
+        item_data = _require_dict(entry, ctx)
+        uid = require_strict_int(_require_key(item_data, "uid", ctx), f"{ctx}.uid")
+        item_type = validate_item_name(_require_key(item_data, "item_type", ctx))
+        pos = require_strict_int(_require_key(item_data, "pos", ctx), f"{ctx}.pos")
 
         if uid in seen_uids:
             raise ValueError(f"Duplicate item uid in save: {uid}")
+        belt_item = BeltItem(uid=uid, item_type=item_type, pos=pos)
         seen_uids.add(uid)
-
-        items.append(BeltItem(uid=uid, item_type=item_type, pos=pos))
+        items.append(belt_item)
 
     return Lane(items)
 
 
 def _serialize_entity(entity: Entity) -> dict[str, Any]:
     data: dict[str, Any] = {
-        "type": entity.entity_type,
+        "type": entity.entity_type.value,
         "x": entity.x,
         "y": entity.y,
     }
     if entity.direction is not None:
         data["direction"] = entity.direction.value
+    if supports_tier(entity.entity_type):
+        data["tier"] = entity.tier
 
     if isinstance(entity, Belt):
-        data["lanes"] = [
-            _serialize_lane(entity.lanes[LEFT_LANE]),
-            _serialize_lane(entity.lanes[RIGHT_LANE]),
-        ]
+        data["lanes"] = {
+            LaneSide.LEFT.json_key: _serialize_lane(entity.lanes[LaneSide.LEFT.index]),
+            LaneSide.RIGHT.json_key: _serialize_lane(entity.lanes[LaneSide.RIGHT.index]),
+        }
     elif isinstance(entity, Inserter):
         data["state"] = entity.state.value
-        data["held_item"] = entity.held_item
-        data["held_uid"] = entity.held_uid
+        data["held_item"] = entity.held.item_type if entity.held is not None else None
+        data["held_uid"] = entity.held.uid if entity.held is not None else None
         data["progress"] = entity.progress
     elif isinstance(entity, Miner):
         data["progress"] = entity.progress
-        data["output_buffer"] = _serialize_counts(entity.output_buffer)
+        data["output_buffer"] = entity.output_buffer.as_dict()
     elif isinstance(entity, Assembler):
         data["recipe_id"] = entity.recipe_id
         data["progress"] = entity.progress
-        data["input_buffer"] = _serialize_counts(entity.input_buffer)
-        data["output_buffer"] = _serialize_counts(entity.output_buffer)
+        data["input_buffer"] = entity.input_buffer.as_dict()
+        data["output_buffer"] = entity.output_buffer.as_dict()
     elif isinstance(entity, Chest):
-        data["inventory"] = _serialize_counts(entity.inventory)
+        data["inventory"] = entity.inventory.as_dict()
 
     return data
 
 
 def _deserialize_entity(raw: Any, seen_uids: set[int]) -> Entity:
     data = _require_dict(raw, "entity")
-    entity_type = _require_str(data.get("type"), "entity.type")
-    x = _require_int(data.get("x"), "entity.x")
-    y = _require_int(data.get("y"), "entity.y")
-    direction = data.get("direction")
+    entity_type = parse_entity_type(_require_key(data, "type", "entity"))
+    x = require_strict_int(_require_key(data, "x", "entity"), "entity.x")
+    y = require_strict_int(_require_key(data, "y", "entity"), "entity.y")
+    direction = (
+        _require_key(data, "direction", "entity")
+        if needs_direction(entity_type)
+        else data.get("direction")
+    )
+    tier = (
+        require_strict_int(_require_key(data, "tier", "entity"), "entity.tier")
+        if supports_tier(entity_type)
+        else data.get("tier", 1)
+    )
 
-    entity = create_entity(entity_type, x, y, direction)
+    entity = create_entity(entity_type, x, y, direction, tier=tier)
 
     if isinstance(entity, Belt):
-        lanes_raw = _require_list(data.get("lanes", [[], []]), "belt.lanes")
-        if len(lanes_raw) != 2:
-            raise ValueError(f"Belt must have 2 lanes, got {len(lanes_raw)}")
-        left_lane = _deserialize_lane(lanes_raw[0], "belt.lanes[0]", seen_uids)
-        right_lane = _deserialize_lane(lanes_raw[1], "belt.lanes[1]", seen_uids)
+        lanes_raw = _require_dict(_require_key(data, "lanes", "belt"), "belt.lanes")
+        expected_keys = {LaneSide.LEFT.json_key, LaneSide.RIGHT.json_key}
+        if set(lanes_raw.keys()) != expected_keys:
+            raise ValueError(
+                f"Belt lanes must have exact keys {sorted(expected_keys)}, got {sorted(lanes_raw.keys())}"
+            )
+        left_lane = _deserialize_lane(
+            lanes_raw[LaneSide.LEFT.json_key], "belt.lanes.left", seen_uids
+        )
+        right_lane = _deserialize_lane(
+            lanes_raw[LaneSide.RIGHT.json_key], "belt.lanes.right", seen_uids
+        )
         entity.lanes = (left_lane, right_lane)
 
     elif isinstance(entity, Inserter):
-        state_str = _require_str(data.get("state", InserterState.IDLE.value), "inserter.state")
+        state_raw = _require_key(data, "state", "inserter")
+        if not isinstance(state_raw, str):
+            raise ValueError(f"Expected string for inserter.state, got {state_raw!r}")
         try:
-            entity.state = InserterState(state_str)
+            state_label = InserterState(state_raw)
         except ValueError as exc:
-            raise ValueError(f"Unknown inserter state: {state_str!r}") from exc
+            raise ValueError(f"Unknown inserter state: {state_raw!r}") from exc
 
-        held_item = data.get("held_item")
-        held_uid = data.get("held_uid")
-        if held_item is None:
-            if held_uid is not None:
-                raise ValueError("Inserter cannot have held_uid without held_item")
-            entity.held_item = None
-            entity.held_uid = None
-        else:
-            entity.held_item = _require_str(held_item, "inserter.held_item")
-            uid = _require_int(held_uid, "inserter.held_uid")
-            if uid < 0:
-                raise ValueError(f"Invalid inserter held_uid: {uid}")
+        held_item = _require_key(data, "held_item", "inserter")
+        held_uid = _require_key(data, "held_uid", "inserter")
+        if held_item is None and held_uid is None:
+            held: HeldItem | None = None
+        elif held_item is not None and held_uid is not None:
+            uid = require_strict_int(held_uid, "inserter.held_uid")
             if uid in seen_uids:
                 raise ValueError(f"Duplicate item uid in save: {uid}")
+            held = HeldItem(uid=uid, item_type=validate_item_name(held_item))
             seen_uids.add(uid)
-            entity.held_uid = uid
+        else:
+            raise ValueError("Inserter held_item and held_uid must both be set or both be null")
 
-        progress = _require_int(data.get("progress", 0), "inserter.progress")
-        if progress < 0:
-            raise ValueError(f"Negative inserter progress: {progress}")
-        entity.progress = progress
+        progress = require_strict_int(
+            _require_key(data, "progress", "inserter"), "inserter.progress"
+        )
+        entity.fsm_state = build_inserter_state(state_label, held, progress)
 
     elif isinstance(entity, Miner):
-        progress = _require_int(data.get("progress", 0), "miner.progress")
+        progress = require_strict_int(
+            _require_key(data, "progress", "miner"), "miner.progress"
+        )
         if progress < 0:
             raise ValueError(f"Negative miner progress: {progress}")
         entity.progress = progress
-        entity.output_buffer = _deserialize_counts(
-            data.get("output_buffer", {}), "miner.output_buffer"
+        entity.output_buffer.load_counts(
+            _require_dict(_require_key(data, "output_buffer", "miner"), "miner.output_buffer")
         )
 
     elif isinstance(entity, Assembler):
-        recipe_id = data.get("recipe_id")
+        recipe_id = _require_key(data, "recipe_id", "assembler")
         if recipe_id is not None:
-            entity.set_recipe(_require_str(recipe_id, "assembler.recipe_id"))
-        progress = _require_int(data.get("progress", 0), "assembler.progress")
+            if not isinstance(recipe_id, str):
+                raise ValueError(f"Expected string or null for assembler.recipe_id: {recipe_id!r}")
+            entity.set_recipe(recipe_id)
+        progress = require_strict_int(
+            _require_key(data, "progress", "assembler"), "assembler.progress"
+        )
         if progress < 0:
             raise ValueError(f"Negative assembler progress: {progress}")
+        if recipe_id is None and progress != 0:
+            raise ValueError("Assembler without recipe cannot have non-zero progress")
         entity.progress = progress
-        entity.input_buffer = _deserialize_counts(
-            data.get("input_buffer", {}), "assembler.input_buffer"
+        entity.input_buffer.load_counts(
+            _require_dict(_require_key(data, "input_buffer", "assembler"), "assembler.input_buffer")
         )
-        entity.output_buffer = _deserialize_counts(
-            data.get("output_buffer", {}), "assembler.output_buffer"
+        entity.output_buffer.load_counts(
+            _require_dict(
+                _require_key(data, "output_buffer", "assembler"), "assembler.output_buffer"
+            )
         )
 
     elif isinstance(entity, Chest):
-        entity.inventory = _deserialize_counts(
-            data.get("inventory", {}), "chest.inventory"
+        entity.inventory.load_counts(
+            _require_dict(_require_key(data, "inventory", "chest"), "chest.inventory")
         )
 
     return entity
 
 
 def world_to_dict(world: World) -> dict[str, Any]:
-    entities_list = [_serialize_entity(e) for e in world.get_all_entities()]
-
-    resources_list: list[dict[str, Any]] = []
-    for coord in sorted(world.resources.keys()):
-        deposit = world.resources[coord]
-        if deposit.is_depleted():
-            continue
-        resources_list.append(
-            {
-                "x": deposit.x,
-                "y": deposit.y,
-                "resource_type": deposit.resource_type,
-                "amount": deposit.amount,
-            }
-        )
-
+    entities_list = [_serialize_entity(entity) for entity in world.get_all_entities()]
+    deposits_list = [
+        {
+            "x": deposit.x,
+            "y": deposit.y,
+            "item_type": deposit.item_type,
+            "amount": deposit.amount,
+        }
+        for deposit in world.query_deposits()
+    ]
     return {
         "version": SAVE_FORMAT_VERSION,
         "width": world.width,
         "height": world.height,
         "tick": world.tick,
         "next_item_uid": world.next_item_uid,
-        "resources": resources_list,
+        "deposits": deposits_list,
         "entities": entities_list,
     }
 
 
-def _parse_world_dict(data: dict[str, Any]) -> World:
+def _parse_world_dict(data: Any) -> World:
     root = _require_dict(data, "save root")
 
-    version = _require_int(root.get("version"), "version")
+    version = require_strict_int(_require_key(root, "version", "save root"), "version")
     if version != SAVE_FORMAT_VERSION:
         raise ValueError(
             f"Unsupported save version {version} (expected {SAVE_FORMAT_VERSION})"
         )
 
-    width = _require_int(root.get("width"), "width")
-    height = _require_int(root.get("height"), "height")
-    tick = _require_int(root.get("tick", 0), "tick")
-    next_item_uid = _require_int(root.get("next_item_uid", 1), "next_item_uid")
+    width = require_strict_int(_require_key(root, "width", "save root"), "width")
+    height = require_strict_int(_require_key(root, "height", "save root"), "height")
+    tick = require_strict_int(_require_key(root, "tick", "save root"), "tick")
+    next_item_uid = require_strict_int(
+        _require_key(root, "next_item_uid", "save root"), "next_item_uid"
+    )
 
+    if width <= 0 or height <= 0 or width > MAX_WORLD_DIM or height > MAX_WORLD_DIM:
+        raise ValueError(f"World dimensions out of allowed range 1..{MAX_WORLD_DIM}: {width}x{height}")
+    if width * height > MAX_WORLD_CELLS:
+        raise ValueError(f"World cell count {width * height} exceeds limit {MAX_WORLD_CELLS}")
     if tick < 0:
         raise ValueError(f"Tick cannot be negative: {tick}")
     if next_item_uid <= 0:
         raise ValueError(f"next_item_uid must be positive: {next_item_uid}")
 
+    deposits_raw = _require_list(_require_key(root, "deposits", "save root"), "deposits")
+    entities_raw = _require_list(_require_key(root, "entities", "save root"), "entities")
+    if len(deposits_raw) > width * height:
+        raise ValueError(f"Too many deposits in save: {len(deposits_raw)}")
+    if len(entities_raw) > MAX_SAVE_ENTITIES:
+        raise ValueError(f"Entity count {len(entities_raw)} exceeds limit {MAX_SAVE_ENTITIES}")
+
     world = World(width, height)
     world.tick = tick
     world.next_item_uid = next_item_uid
 
-    resources_raw = _require_list(root.get("resources", []), "resources")
-    for i, entry in enumerate(resources_raw):
-        res_data = _require_dict(entry, f"resources[{i}]")
-        rx = _require_int(res_data.get("x"), f"resources[{i}].x")
-        ry = _require_int(res_data.get("y"), f"resources[{i}].y")
-        res_type = _require_str(
-            res_data.get("resource_type"), f"resources[{i}].resource_type"
-        )
-        amount = _require_int(res_data.get("amount"), f"resources[{i}].amount")
+    for i, entry in enumerate(deposits_raw):
+        ctx = f"deposits[{i}]"
+        dep_data = _require_dict(entry, ctx)
+        dx = require_strict_int(_require_key(dep_data, "x", ctx), f"{ctx}.x")
+        dy = require_strict_int(_require_key(dep_data, "y", ctx), f"{ctx}.y")
+        item_type = validate_item_name(_require_key(dep_data, "item_type", ctx))
+        amount = require_strict_int(_require_key(dep_data, "amount", ctx), f"{ctx}.amount")
 
-        if not world.in_bounds(rx, ry):
-            raise ValueError(f"Resource out of bounds: {(rx, ry)}")
-        if amount <= 0:
-            raise ValueError(f"Resource amount must be positive: {amount}")
-        if (rx, ry) in world.resources:
-            raise ValueError(f"Duplicate resource deposit at {(rx, ry)}")
+        if not world.in_bounds(dx, dy):
+            raise ValueError(f"Deposit out of bounds: {(dx, dy)}")
+        if (dx, dy) in world.deposits:
+            raise ValueError(f"Duplicate deposit at {(dx, dy)}")
 
-        world.resources[(rx, ry)] = Deposit(
-            x=rx,
-            y=ry,
-            resource_type=res_type,
-            amount=amount,
-        )
+        world.deposits[(dx, dy)] = Deposit(x=dx, y=dy, item_type=item_type, amount=amount)
 
     seen_uids: set[int] = set()
-    entities_raw = _require_list(root.get("entities", []), "entities")
     for entry in entities_raw:
         entity = _deserialize_entity(entry, seen_uids)
         if not world.add_entity(entity):
             raise ValueError(
-                f"Cannot place {entity.entity_type} at {(entity.x, entity.y)} "
+                f"Cannot place {entity.entity_type.value} at {(entity.x, entity.y)} "
                 f"(out of bounds or overlapping)"
             )
 
@@ -309,28 +313,30 @@ def _parse_world_dict(data: dict[str, Any]) -> World:
             f"existing item uid ({max(seen_uids)})"
         )
 
-    world.belts_dirty = True
-    world.power_dirty = True
+    world.validate_spatial_index()
     return world
 
 
-def world_from_dict(data: dict[str, Any]) -> World:
+def world_from_dict(data: Any) -> World:
     try:
         return _parse_world_dict(data)
     except ValueError as exc:
-        raise PersistenceError(str(exc)) from exc
+        raise PersistenceError(f"Schema validation failed: {exc}") from exc
 
 
 def world_to_json(world: World) -> str:
-    payload = world_to_dict(world)
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return json.dumps(world_to_dict(world), sort_keys=True, separators=(",", ":"))
 
 
 def world_from_json(raw_json: str) -> World:
+    if not isinstance(raw_json, str):
+        raise PersistenceError(f"Expected JSON string, got {type(raw_json).__name__}")
+    if len(raw_json) > MAX_SAVE_BYTES:
+        raise PersistenceError(f"Save payload exceeds maximum size of {MAX_SAVE_BYTES} bytes")
     try:
         parsed = json.loads(raw_json)
-    except json.JSONDecodeError as exc:
-        raise PersistenceError(f"Invalid JSON save data: {exc}") from exc
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise PersistenceError(f"JSON parsing failed: {exc}") from exc
     return world_from_dict(parsed)
 
 
@@ -341,26 +347,53 @@ def _write_text_fsync(path: Path, content: str) -> None:
         os.fsync(handle.fileno())
 
 
-def save_world_to_file(world: World, path: str | Path) -> None:
+def _replace_file(src: Path, dst: Path) -> None:
+    os.replace(src, dst)
+
+
+def save_world_to_file(
+    world: World,
+    path: str | Path,
+    *,
+    write_fn: Callable[[Path, str], None] = _write_text_fsync,
+    replace_fn: Callable[[Path, Path], None] = _replace_file,
+) -> None:
     file_path = Path(path)
-    tmp_path = file_path.with_name(f"{file_path.name}.tmp")
     payload = world_to_json(world)
+    tmp_path: Path | None = None
     try:
-        _write_text_fsync(tmp_path, payload)
-        os.replace(tmp_path, file_path)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=file_path.parent,
+            prefix=f".{file_path.name}.",
+            suffix=".tmp",
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        write_fn(tmp_path, payload)
+        replace_fn(tmp_path, file_path)
     except OSError as exc:
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         raise PersistenceError(f"Failed to save world to {file_path}: {exc}") from exc
 
 
 def load_world_from_file(path: str | Path) -> World:
     file_path = Path(path)
     try:
-        raw_json = file_path.read_text(encoding="utf-8")
+        with file_path.open("rb") as handle:
+            raw_bytes = handle.read(MAX_SAVE_BYTES + 1)
     except OSError as exc:
-        raise PersistenceError(f"Failed to read world from {file_path}: {exc}") from exc
+        raise PersistenceError(f"Failed to read save file {file_path}: {exc}") from exc
+
+    if len(raw_bytes) > MAX_SAVE_BYTES:
+        raise PersistenceError(f"Save file exceeds maximum size of {MAX_SAVE_BYTES} bytes")
+
+    try:
+        raw_json = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PersistenceError(f"Invalid UTF-8 in save file {file_path}: {exc}") from exc
+
     return world_from_json(raw_json)
